@@ -1,0 +1,475 @@
+---
+title: "Imputation and Analysis With Wine Data"
+author: "James Williams"
+date: "3/6/2020"
+output: html_document
+---
+
+
+
+**Objective Overview**
+
+This was a homework assignmenet I completed for my econometrics in pursuit of my MS in Applied Economics at the Woods college of Advancing Studies at Boston College. Per the assignments instructions:
+
+> In this homework assignment, you will explore, analyze and model a data set containing information on approximately 12,000 commercially available wines. The variables are mostly related to the chemical properties of the wine being sold. The response variable is the number of sample cases of wine that were purchased by wine distribution companies after sampling a wine. These cases would be used to provide tasting samples to restaurants and wine stores around the United States. The more sample cases purchased, the more likely is a wine to be sold at a high-end restaurant. A large wine manufacturer is studying the data in order to predict the number of wine cases ordered based upon the wine characteristics. If the wine manufacturer can predict the number of cases, then that manufacturer will be able to adjust their wine offering to maximize sales.
+
+One caveat before my analyis is that the train/test data for this assignment was split into two CSV files. Given they are two seperate files, there will be no need
+to do this within the analysis. Let's get started! 
+
+
+
+
+```{r include=FALSE}
+packages=c('dplyr','tidyr','ggplot2','corrplot',
+           'psych','mice','glmnet','VIM', 'stringr', 
+           'corrplot', 'cowplot', 'caret')
+lapply(packages,library, character.only=T)
+wine=read.csv('/Users/james/Desktop/data/wine.training.data.csv',stringsAsFactors = F, na.strings=c(""," ","NA", "n.a.", "-", "--",'<NA>'))
+```
+
+
+*Exploratory Analyis*
+
+First, lets get some summary stats, and view the structure of this dataset. 
+
+```{r}
+describe(wine)
+str(wine)
+
+```
+
+So it looks like there are two ordinal vars., and everything else is numeric. Theres also quite a lot of negative values, so log transformations will probably be out of play in modeling. Let's check for NAS because it seems there are some. 
+
+```{r}
+na.cols <- which(colSums(is.na(wine)) > 0)
+sort(colSums(sapply(wine[na.cols], is.na)), decreasing = TRUE)
+```
+
+Let's just take care of those now for the sake of convience. I am going to impute these missing values using  predictive mean matching for the continuous variables, and polytomous logistic regression for the ordinal values. First I am going to recode the ordinal variables as factors, and change their numeric assignments to something that is a bit more clear. 
+
+```{r}
+
+df<-wine %>% 
+  mutate(STARS=as.factor(ifelse(STARS==1,'Poor',ifelse(STARS==2,'Fair',
+                                                       ifelse(STARS==3,'Good',ifelse(STARS==4,'Great',NA)))))) %>%
+  mutate(LabelAppeal=as.factor(ifelse(LabelAppeal==-2,'Poor',ifelse(LabelAppeal==-1,'Fair',
+                                                                    ifelse(LabelAppeal==-0,'Good',
+                                                                           ifelse(LabelAppeal==1,'Great', ifelse(LabelAppeal==2,'Exceptional',NA)))))))
+
+df<-df %>% 
+  mutate(LabelAppeal=factor(LabelAppeal, levels(LabelAppeal)[c(5,2,3,4,1)])) %>% 
+  mutate(STARS=factor(STARS, levels(STARS)[c(4,1,2,3)])) #Restructuring factor levels for plotting purposes later. 
+
+```
+
+Ok let's now perform the imputations to replace the NAs in the training set.
+
+```{r}
+impute_df<- mice(df, m=1, methood=c('pmm', 'polyreg')	, maxit =20,seed=123)
+impute_df
+
+```
+
+Boom. I think we now can select one of these imputed data sets and train some models for predicting target cases and classifying the STARS scores given a wine's chemical components. Lets define the target var., establish correlations, create exploratory plots, and the build some models.
+
+```{r}
+df<-mice::complete(impute_df) %>% 
+  dplyr::select(-INDEX )
+
+df_corr<-df%>% dplyr::select(-c(STARS, LabelAppeal)) %>% 
+  cor()
+corrplot(df_corr, method = 'color')
+
+```
+
+As we can see there are pretty weak correlations between the target and the rest of the independent vars. There also some evidence of weak multicolinearity between the predictors, but nothing substatial. Maybe we have to drop some predictos when we model, but let's leave that to a VIF check after creating models.
+
+The first plot I am going to make besides this corr.plot is a histogram of the distribution of the target var. 
+```{r}
+df %>% 
+  ggplot(., aes(x=TARGET))+
+  geom_freqpoly()+
+  theme_light()
+```
+
+So from this very basic freq. poly histogram which shows the overall distribution of the target var. As we can see, it is practically gaussian, except for the large number of 0s observed. based on this, it might behoove us to perform a regression which accounts for this unique distribution. Let's also look at the average number of cases sold WRT to stars,and the total number of cases sold WRT stars. 
+
+```{r}
+p1<-df %>% group_by(STARS) %>% 
+  summarize(mean = mean(TARGET), sd = sd(TARGET), N = n()) %>% 
+  mutate(se = sd / sqrt(N),
+         lower = mean - qt(1 - (0.05 / 2), N - 1) * se, 
+         upper = mean + qt(1 - (0.05 / 2), N - 1) * se) %>%  
+  ggplot(., aes(STARS, mean, fill=STARS))+
+  geom_bar(stat='identity')+
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.35)+
+  labs(y='Target Cases', x='Stars', title = 'Average of Cases Sold By Stars')+
+  theme_light()
+  
+
+p2<-df %>% group_by(STARS) %>% 
+  summarize(mean = mean(TARGET), sd = sd(TARGET), N = n()) %>% 
+  mutate(se = sd / sqrt(N),
+         lower = mean - qt(1 - (0.05 / 2), N - 1) * se, 
+         upper = mean + qt(1 - (0.05 / 2), N - 1) * se) %>%  
+  ggplot(., aes(STARS, N, fill=STARS))+
+  geom_bar(stat='identity')+
+  labs(y='Target Cases', x='Stars', title = 'Number of Cases Sold By Stars')+
+  theme_light()
+
+cowplot::plot_grid(p1,p2, labels = "auto")
+```
+
+So in total, many more 'Poor' cases were sole than 'Great' cases, but on average, a wine that scored higher in Stars sold more cases than those which scored worse. Let's create some plots that will show the fit of the vars. with the greatest correlation to the target. 
+
+```{r}
+p1<-df %>%
+  ggplot(., aes(x=AcidIndex, y=TARGET)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Acid Index", title="Purchases WRT Acid Index")+
+  theme_light()
+
+p2<-df %>%
+  ggplot(., aes(x=AcidIndex, y=TARGET, color=STARS)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Acid Index", title="Purchases WRT Acid Index and Stars")+
+  theme_light()
+
+
+cowplot::plot_grid(p1,p2, labels = "auto")
+```
+
+It would appear that a lower Acid Index is prefered with wines as there is a clear negative relationship, since as Acid Index increases, cases purchased decreases. Additionally, wines that are rated highly WRT STARS are bought with lower values of Acid Index and vice versa. 
+
+```{r}
+p1<-df %>%
+  ggplot(., aes(x=Alcohol, y=TARGET)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Alcohol%", title="Purchases WRT Alcohol%")+
+  theme_light()
+
+p2<-df %>%
+  ggplot(., aes(x=Alcohol, y=TARGET, color=STARS)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Alcohol%", title="Purchases WRT Alcohol% and Stars")+
+  theme_light()
+
+p3<-df %>%
+  ggplot(., aes(x=Alcohol, y=TARGET, color=LabelAppeal)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Alcohol%", title="Purchases WRT Acidity and Label Appeal")+
+  theme_light()
+cowplot::plot_grid(p1,p2, p3, labels = "auto")
+
+```
+
+As the level of alchohol increases, the purchases of wine increases generally. Wine rated highly WRT Stars and Label Appeal over the entire domain of alcohol. 
+
+```{r}
+p1<-df %>%
+  ggplot(., aes(x=VolatileAcidity, y=TARGET)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "V. Acidity", title="Purchases WRT V.Acidity")+
+  theme_light()
+
+
+p2<-df%>%
+  ggplot(., aes(x=VolatileAcidity, y=TARGET, color=STARS)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "V. Acidity", title="Purchases WRT V.Acidity and Stars")+
+  theme_light()
+
+
+p3<-df%>%
+  ggplot(., aes(x=VolatileAcidity, y=TARGET, color=LabelAppeal)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "V. Acidity", title="Purchases WRT V.Acidity and Label Appeal")+
+  theme_light()
+cowplot::plot_grid(p1,p2, p3, labels = "auto")
+```
+
+It would appear that a lower V. Acidity is prefered with wines as there is a clear negative relationship, since as Acid Index increases, cases purchased decreases. Wines tend to be bought over the entire domain of v. Acidity except for wines that scored 'Exceptional' WRT Label Appeal. These wines follow the overall negative trend in wine cases sold as v.Acidity increases. 
+
+```{r}
+p1<-df %>%
+  ggplot(., aes(x=TotalSulfurDioxide, y=TARGET)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Total Sulfur Dioxidey", title="Purchases WRT Total Sulfur Dioxide")+
+  theme_light()
+
+
+p2<-df %>%
+  ggplot(., aes(x=TotalSulfurDioxide, y=TARGET, color=STARS)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Total Sulfur Dioxide", title="Purchases WRT Total Sulfur Dioxide and Stars")+
+  theme_light()
+
+
+p3<-df%>%
+  ggplot(., aes(x=TotalSulfurDioxide, y=TARGET, color=LabelAppeal)) + 
+  geom_smooth(se=F) +
+  labs(y="Target Cases", x = "Total Sulfur Dioxide", title="Purchases WRT Total Sulfur Dioxide and Label Appeal")+
+  theme_light()
+cowplot::plot_grid(p1,p2, p3, labels = "auto")
+```
+
+No discernable relationship's to be seen here. Let's model.
+
+**Train Models**
+
+The first model we will train is a stanard multiple linear regression on all of the predictors. 
+
+```{r}
+library(Metrics)
+library(regclass)
+y<-df$TARGET
+df_train<-df%>%  
+  dplyr::select(.,-TARGET)
+linear_mod<- function(df, y){
+  m1<-lm(y~., data=df_train)
+  plot(m1$residuals)
+  hist(m1$residuals)
+  m1_train_preds<- predict(m1, df_train)
+  mae_m1<-mae(y, m1_train_preds)
+  print(paste('The MAE is', mae_m1))
+  print(VIF(m1))
+  return(summary(m1))
+  }
+
+linear_mod(df_train,y)  
+     
+
+
+
+```
+
+Not too bad of a model. There seems to be a large dispersion of the residuals v fitted values well above zero, but almost half of the variation between the predictors and the taregt is captured.  Additionally there is a pretty low MAE when using the model to predict the training values. Finally, there seems to be no alarming level of VIF amongst the predictors. I think it might be good to fit a lasso regression to capture the best subset.
+
+```{r}
+
+x<-model.matrix(TARGET ~ ., data = df)[,-1]
+
+lasso_reg<- glmnet(x, y, alpha = 1)
+
+plot(lasso_reg, xvar='lambda')
+
+
+```
+
+Initially we see quite a few of the features retain a rather large magnitute until $$log(\lambda)$$  reaches -1, and that many of the vars. are a constatnt zero throughout the model iterations. Let's tune the hyper parameter lambda to see what our best subset may looklike. 
+
+```{r}
+lasso_cv <- cv.glmnet(x = x, y = y,alpha = 1)
+# plot results
+plot(lasso_cv)
+```
+
+We can see that the MSE is minimized between -4 <= $$log(\lambda)$$ <= -3. 
+
+```{r}
+min(lasso_cv$cvm) # minimum MSE
+
+lasso_cv$lambda.min # lambda for this min MSE
+## [1] 0.003521887
+
+lasso_cv$cvm[lasso_cv$lambda == lasso_cv$lambda.1se]  # 1 st.error of min MSE
+## [1] 0.02562055
+lasso_cv$lambda.1se  # lambda for this MSE
+## [1] 0.01180396
+```
+
+```{r}
+lasso_min <- glmnet(
+  x = x,
+  y = y,
+  alpha = 1
+)
+
+plot(lasso_min, xvar = "lambda")
+abline(v = log(lasso_cv$lambda.min), col = "red", lty = "dashed")
+abline(v = log(lasso_cv$lambda.1se), col = "red", lty = "dashed")
+```
+
+So from these plots we can see the model using all of its features has the lowest overall MSE, but the variability in this model will be high, as seen in the linear model formed above. By using the lambda value 1 SE from the min SE, we will decrease the number of overall features, and variability. 
+
+```{r}
+library(broom)
+p1<- coef(lasso_cv, s = "lambda.min") %>%
+  tidy() %>%
+  filter(row != "(Intercept)") %>%
+  ggplot(aes(value, reorder(row, value), color = value > 0)) +
+  geom_point(show.legend = FALSE) +
+  ggtitle("Influential variables") +
+  xlab("Coefficient") +
+  ylab(NULL)
+p2<- coef(lasso_cv, s = "lambda.1se") %>%
+  tidy() %>%
+  filter(row != "(Intercept)") %>%
+  ggplot(aes(value, reorder(row, value), color = value > 0)) +
+  geom_point(show.legend = FALSE) +
+  ggtitle("Influential variables") +
+  xlab("Coefficient") +
+  ylab(NULL)
+
+cowplot::plot_grid(p1,p2, labels = 'auto')
+```
+
+So as expected, the number of predictos shrunk from the model using the lambda 1 SE away from the min SE. That bbeing said using the lambda 1 SE from the min SE basically says that the target cases is merely a function of STAR rating and label appeal. Since I am using MAE as my benchmark, lets go ahead and pridict on both, and then we can determine which to use from there. 
+
+```{r}
+pred_min <- predict(lasso_cv, s = lasso_cv$lambda.min, x)
+pred_1se <- predict(lasso_cv, s = lasso_cv$lambda.1se, x)
+mae_min <- MAE(pred_min, y)
+mae_1se <- MAE(pred_1se, y)
+print(paste('The min. MAE is',mae_min))
+print(paste('The 1 SE from the min. MAE is',mae_1se))
+
+
+```
+
+Close, but not suprisingly, the MAE of the min MSE lasso model had a lower MAE score. We shall use this subset of predictors to predict target cases on our models going forward. so the new set of predictors will be: 
+
+```{r}
+df_train2 <- df %>% 
+  dplyr::select(-c(CitricAcid, Alcohol, FreeSulfurDioxide, TotalSulfurDioxide, ResidualSugar,
+            Sulphates, pH))
+colnames(df_train2)
+```
+
+Now lets try fitting a linear model once more. 
+
+```{r}
+df_train3 <-df_train2 %>% 
+  dplyr::select(-TARGET)
+
+m1<-lm(y~., data=df_train3)
+  
+linear_mod(df=df_train3, y=y)
+```
+
+So the MAE slighlt improved, but the residuals are still not close enough to zero. What we should do now is try fitting models that account for distributions more closely related to that which the target exhibits. We are going to fit poisson and negative binomial count regressions. We will also zero inflated models since there are a large number of observations of zero cases bought. 
+
+```{r}
+m2 <- glm(y~., df_train3, family = 'poisson')
+m2_preds <- predict(m2, df_train3)
+mae_m2 <- MAE(m2_preds,y)
+summary(m2)
+print(paste('The MAE is', mae_m2))
+plot(m2$residuals)
+hist(m2$residuals)
+```
+
+Slightly worse MAE than the linear models, and the residuals are much less normally distributed than the standard linear model, but they are more banded around 0 than the standard linear model. Let's fit a negative binomial now. 
+
+```{r}
+library(MASS)
+m3 <- glm.nb(y~., df_train3)
+m3_preds <- predict(m3, df_train3)
+mae_m3 <- MAE(m3_preds,y)
+summary(m3)
+print(paste('The MAE is', mae_m3))
+plot(m3$residuals)
+hist(m3$residuals)
+```
+
+Pretty much the exact same results as m3. Lets try using zero inflated models. 
+
+```{r}
+library(MASS)
+library(pscl)
+m4 <- zeroinfl(y ~., data=df_train3)
+m4_preds <- predict(m4, df_train)
+mae_m4 <- MAE(m4_preds,y)
+summary(m4)
+print(paste('The MAE is', mae_m4))
+plot(m4$residuals)
+hist(m4$residuals)
+```
+
+
+```{r}
+m5 <- zeroinfl(y ~., data=df_train3, dist = 'negbin')
+m5_preds <- predict(m5, df_train)
+mae_m5 <- MAE(m5_preds,y)
+summary(m5)
+print(paste('The MAE is', mae_m5))
+plot(m5$residuals)
+hist(m5$residuals)
+```
+
+
+So these models had pretty similar results. As we can see, they have the the lowest MAE scores, they have pretty normally distributed residuals, and their residuals are more banded around zero than some of the other models. I am of the opinion that the linear model with the subset of vars derived from the lasso, and the two zero inflated models are the three we should test. Let's go ahead and load the test data, amke the transformations we need to, and from there discern which model has the overall best performence. 
+
+**Test Models**
+
+```{r}
+wine_test=read.csv('/Users/james/Desktop/wine_test.csv',stringsAsFactors = F, na.strings=c(""," ","NA", "n.a.", "-", "--",'<NA>'))
+
+na.cols <- which(colSums(is.na(wine_test)) > 0)
+sort(colSums(sapply(wine_test[na.cols], is.na)), decreasing = TRUE)
+print(length(wine_test$FixedAcidity))
+
+```
+
+So naturally the target is missing. I am going to drop that column, and all of the missing valued columns, since we have ample data to test with. Lets get ready to model by getting the subset of our predictos set up, and 
+
+```{r}
+wine_test <- wine_test %>% 
+  mutate(STARS=as.factor(ifelse(STARS==1,'Poor',ifelse(STARS==2,'Fair',ifelse(STARS==3,'Good',ifelse(STARS==4,'Great',NA))))))%>%
+  
+  mutate(LabelAppeal=as.factor(ifelse(LabelAppeal==-2,'Poor',ifelse(LabelAppeal==-1,'Fair',
+                                                                    ifelse(LabelAppeal==-0,'Good',
+                                                                           ifelse(LabelAppeal==1,'Great', ifelse(LabelAppeal==2,'Exceptional',NA))))))) %>% 
+  dplyr::select(c(FixedAcidity, VolatileAcidity, Chlorides, Density,
+         LabelAppeal, AcidIndex, STARS))
+
+wine_test <- na.omit(wine_test)
+
+length(wine_test$FixedAcidity)
+   
+```
+
+Plenty of NA free data to test on. let's do it. 
+```{r}
+wine_test_lm<-predict(m1, wine_test)
+print(paste("The MAE of the linear model is", mae(y[1:2388], wine_test_lm)))
+```
+
+Pretty good. Pretty accurate!
+ 
+
+```{r}
+wine_test_poisson<-predict(m4, wine_test)
+print(paste("The MAE of the poisson model is", mae(y[1:2388], wine_test_poisson)))
+```
+
+Slightly worse. 
+
+```{r}
+wine_test_negbin<-predict(m5, wine_test)
+print(paste("The MAE of the negative binomial model is", mae(y[1:2388], wine_test_negbin)))
+```
+
+So the lasso regression model is the best predictor of cases sold. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
